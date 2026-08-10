@@ -13,7 +13,6 @@
 #include <tuple>
 
 #include <eigen3/Eigen/Dense>
-#include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
@@ -34,17 +33,18 @@
 #include "hardware/device/lk_motor.hpp"
 #include "hardware/device/remote_control.hpp"
 #include "hardware/device/supercap.hpp"
+#include "hardware/device/vt13.hpp"
 #include "hardware/util/status_monitor.hpp"
 
 namespace rmcs_core::hardware {
 
 using Clock = std::chrono::steady_clock;
 
-class DeformableInfantryOmni
+class DeformableInfantryOmniB
     : public rmcs_executor::Component
     , public rclcpp::Node {
 public:
-    DeformableInfantryOmni()
+    DeformableInfantryOmniB()
         : Node(
               get_component_name(),
               rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true))
@@ -76,7 +76,7 @@ public:
             });
     }
 
-    ~DeformableInfantryOmni() override = default;
+    ~DeformableInfantryOmniB() override = default;
 
     void before_updating() override { top_board_->request_hard_sync_read(); }
 
@@ -111,20 +111,210 @@ private:
         "right_front",
     };
 
-    class Command : public rmcs_executor::Component {
+    class Command : public Component {
     public:
-        explicit Command(DeformableInfantryOmni& deformableInfantry)
+        explicit Command(DeformableInfantryOmniB& deformableInfantry)
             : deformableInfantry(deformableInfantry) {}
 
         void update() override { deformableInfantry.command_update(); }
 
-        DeformableInfantryOmni& deformableInfantry;
+        DeformableInfantryOmniB& deformableInfantry;
+    };
+
+    struct TopBoard final : public librmcs::board::RmcsBoardLite::Callback {
+    public:
+        explicit TopBoard(
+            DeformableInfantryOmniB& status, Component& command,
+            const std::string& serial_filter = {})
+            : status_{status}
+            , tf_{status.tf_}
+            , bmi088_{device::Bmi088Ekf::Config{
+                  .body_to_sensor =
+                      Eigen::AngleAxisd{std::numbers::pi / 2.0, Eigen::Vector3d::UnitX()}
+                          .toRotationMatrix()}}
+            , gimbal_pitch_motor_(status, command, "/gimbal/pitch")
+            , gimbal_left_friction_(status, command, "/gimbal/left_friction")
+            , gimbal_right_friction_(status, command, "/gimbal/right_friction") {
+
+            gimbal_pitch_motor_.configure(
+                device::LkMotor::Config{device::LkMotor::Type::kMG4010Ei10}
+                    .set_reversed()
+                    .set_encoder_zero_point(
+                        static_cast<int>(status.get_parameter("pitch_motor_zero_point").as_int())));
+
+            gimbal_left_friction_.configure(
+                device::DjiMotor::Config{device::DjiMotor::Type::kM3508, 1}
+                    .set_reduction_ratio(1.)
+                    .set_reversed());
+            gimbal_right_friction_.configure(
+                device::DjiMotor::Config{device::DjiMotor::Type::kM3508, 2}.set_reduction_ratio(
+                    1.));
+
+            status.register_output("/gimbal/yaw/velocity_imu", gimbal_yaw_velocity_bmi088_);
+            status.register_output("/gimbal/pitch/velocity_imu", gimbal_pitch_velocity_bmi088_);
+            status.register_output("/gimbal/auto_aim/imu_snapshot", imu_snapshot_output_);
+            status.register_output("/gimbal/auto_aim/exposure_signal", camera_signal_output_);
+
+            auto options = librmcs::board::AdvancedOptions{};
+            options.dangerously_skip_version_checks = true;
+            board_ = std::make_unique<librmcs::board::RmcsBoardLite>(*this, serial_filter, options);
+
+            board_->start_transmit().gpio_digital_read(
+                Spec::kGpios.kUart1Rx, //
+                {
+                    .period_ms = 0,
+                    .asap = false,
+                    .rising_edge = false,
+                    .falling_edge = true,
+                    .capture_timestamp = true,
+                    .pull = librmcs::data::GpioPull::kUp,
+                });
+
+            board_->start_transmit().uart_config(Spec::kUarts.kUart0, {.baudrate = 921600});
+
+            status_.remote_control_->register_vt13(&vt13_);
+        }
+        ~TopBoard() override = default;
+
+        [[nodiscard]] auto gimbal_yaw_velocity() const -> double {
+            return *gimbal_yaw_velocity_bmi088_;
+        }
+
+        void request_hard_sync_read() {
+            // RMCS-lite top board variant currently has no GPIO hard-sync request
+            // path.
+        }
+
+        void update() {
+            vt13_.update_status();
+            gimbal_pitch_motor_.update_status();
+            gimbal_left_friction_.update_status();
+            gimbal_right_friction_.update_status();
+
+            const double pitch_encoder_angle = gimbal_pitch_motor_.angle();
+
+            if (auto snapshot = bmi088_.snapshot()) {
+                *gimbal_pitch_velocity_bmi088_ = snapshot->gyro_body.y();
+                *gimbal_yaw_velocity_bmi088_ = snapshot->gyro_body.z();
+                tf_->set_transform<rmcs_description::PitchLink, rmcs_description::OdomImu>(
+                    snapshot->orientation.conjugate());
+            }
+
+            tf_->set_state<rmcs_description::YawLink, rmcs_description::PitchLink>(
+                pitch_encoder_angle);
+        }
+
+        void command_update() const {
+            auto builder = board_->start_transmit();
+            {
+                auto packet = gimbal_pitch_motor_.generate_torque_command();
+                builder.can_transmit(
+                    Spec::kCans.kCan0, //
+                    {
+                        .can_id = 0x141,
+                        .can_data = packet.as_bytes(),
+                    });
+            }
+            {
+                auto packet = device::CanPacket8{uint64_t{0}};
+                packet << gimbal_right_friction_;
+                builder.can_transmit(
+                    Spec::kCans.kCan1, //
+                    {
+                        .can_id = gimbal_right_friction_.send_id(),
+                        .can_data = packet.as_bytes(),
+                    });
+            }
+            {
+                auto packet = device::CanPacket8{uint64_t{0}};
+                packet << gimbal_left_friction_;
+                builder.can_transmit(
+                    Spec::kCans.kCan2, //
+                    {
+                        .can_id = gimbal_left_friction_.send_id(),
+                        .can_data = packet.as_bytes(),
+                    });
+            }
+        }
+
+        void can_receive_callback(const Spec::Can& can, const View::Can& data) override {
+            if (data.is_extended_can_id || data.is_remote_transmission) [[unlikely]]
+                return;
+            if (can == Spec::kCans.kCan0) {
+                if (data.can_id == 0x141)
+                    gimbal_pitch_motor_.store_status(data.can_data);
+                monitor_.tick("Top::Can0", data.can_id);
+            } else if (can == Spec::kCans.kCan1) {
+                gimbal_right_friction_.match_then_store_status(data.can_id, data.can_data);
+                monitor_.tick("Top::Can1", data.can_id);
+            } else if (can == Spec::kCans.kCan2) {
+                gimbal_left_friction_.match_then_store_status(data.can_id, data.can_data);
+                monitor_.tick("Top::Can2", data.can_id);
+            }
+        }
+
+        void uart_receive_callback(const Spec::Uart& uart, const View::Uart& data) override {
+            if (uart == Spec::kUarts.kUart0)
+                vt13_.store_status(data.uart_data);
+        }
+
+        void accelerometer_receive_callback(const View::ImuAccelerometer& data) override {
+            const auto timestamp = board_clock_lifter_.advance_timebase(data.timestamp_quarter_us);
+            bmi088_.push_accelerometer_sample(data.x, data.y, data.z, timestamp);
+            monitor_.tick("Top::Imu", "Acc");
+        }
+
+        void gyroscope_receive_callback(const View::ImuGyroscope& data) override {
+            const auto timestamp = board_clock_lifter_.lift_timestamp(data.timestamp_quarter_us);
+            monitor_.tick("Top::Imu", "Gyr");
+            if (!timestamp.has_value())
+                return;
+            auto snapshot =
+                bmi088_.try_update_with_gyroscope_sample(data.x, data.y, data.z, *timestamp);
+            if (snapshot)
+                imu_snapshot_output_.emit(*snapshot);
+        }
+
+        void gpio_digital_read_result_callback(
+            const Spec::Gpio& gpio, const View::GpioDigital& data) override {
+            if (gpio != Spec::kGpios.kUart1Rx)
+                return;
+            if (!data.timestamp_quarter_us)
+                return;
+
+            const auto timestamp = board_clock_lifter_.lift_timestamp(*data.timestamp_quarter_us);
+            if (!timestamp.has_value())
+                return;
+
+            camera_signal_output_.emit(*timestamp);
+            monitor_.tick("Top::CameraSync", "Active");
+        }
+
+        auto status() const -> std::vector<std::string> { return monitor_.text(); }
+
+        DeformableInfantryOmniB& status_;
+        OutputInterface<rmcs_description::Tf>& tf_;
+        OutputInterface<double> gimbal_yaw_velocity_bmi088_;
+        OutputInterface<double> gimbal_pitch_velocity_bmi088_;
+
+        EventOutputInterface<rmcs_msgs::ImuSnapshot> imu_snapshot_output_;
+        EventOutputInterface<rmcs_msgs::BoardClock::time_point> camera_signal_output_;
+
+        device::Bmi088Ekf bmi088_;
+        device::BoardClockLifter board_clock_lifter_;
+        device::Vt13 vt13_;
+        device::LkMotor gimbal_pitch_motor_;
+        device::DjiMotor gimbal_left_friction_;
+        device::DjiMotor gimbal_right_friction_;
+
+        StatusMonitor monitor_{};
+        std::unique_ptr<librmcs::board::RmcsBoardLite> board_;
     };
 
     struct BottomBoard final : public librmcs::board::RmcsBoardLite::Callback {
     public:
         explicit BottomBoard(
-            DeformableInfantryOmni& status, rmcs_executor::Component& command,
+            DeformableInfantryOmniB& status, Component& command,
             const std::string& serial_filter = {})
             : status_{status}
             , command_{command}
@@ -150,7 +340,8 @@ private:
             for (auto& motor : chassis_wheel_motors_)
                 motor.configure(
                     device::DjiMotor::Config{device::DjiMotor::Type::kM3508, 1}
-                        .set_reduction_ratio(19.0)
+                        .set_reversed()
+                        .set_reduction_ratio(13.0)
                         .enable_multi_turn_angle());
 
             for (auto& motor : chassis_joint_motors_)
@@ -177,12 +368,12 @@ private:
             for (size_t i = 0; i < 4; ++i) {
                 status.register_output(
                     std::format(
-                        "/chassis/{}_joint/physical_angle", DeformableInfantryOmni::kJointName[i]),
+                        "/chassis/{}_joint/physical_angle", DeformableInfantryOmniB::kJointName[i]),
                     joint_physical_angle_[i], kNaN);
                 status.register_output(
                     std::format(
                         "/chassis/{}_joint/physical_velocity",
-                        DeformableInfantryOmni::kJointName[i]),
+                        DeformableInfantryOmniB::kJointName[i]),
                     joint_physical_velocity_[i], kNaN);
             }
             status.register_output("/chassis/encoder/alpha", encoder_alpha_, kNaN);
@@ -200,7 +391,6 @@ private:
 
             status_.remote_control_->register_dr16(&dr16_);
         }
-
         void update() {
             imu_.update_status();
             *chassis_yaw_velocity_imu_ = imu_.gz();
@@ -367,7 +557,7 @@ private:
 
         static constexpr double kJointZeroPhysicalAngleRad = 62.5 * std::numbers::pi / 180.0;
 
-        DeformableInfantryOmni& status_;
+        DeformableInfantryOmniB& status_;
         Component& command_;
 
         std::unique_ptr<librmcs::board::RmcsBoardLite> board_;
@@ -412,7 +602,7 @@ private:
 
         device::Bmi088 imu_{1000, 0.2, 0.0};
         device::LkMotor gimbal_yaw_motor_{status_, command_, "/gimbal/yaw"};
-        device::Dr16 dr16_{};
+        device::Dr16 dr16_;
 
         device::DjiMotor chassis_wheel_motors_[4]{
             device::DjiMotor{status_, command_, "/chassis/left_front_wheel"},
@@ -633,188 +823,6 @@ private:
         StatusMonitor monitor_{};
     };
 
-    struct TopBoard final : public librmcs::board::RmcsBoardLite::Callback {
-    public:
-        explicit TopBoard(
-            DeformableInfantryOmni& status, rmcs_executor::Component& command,
-            const std::string& serial_filter = {})
-            : tf_{status.tf_}
-            , bmi088_{device::Bmi088Ekf::Config{
-                  .body_to_sensor =
-                      Eigen::AngleAxisd{std::numbers::pi / 2.0, Eigen::Vector3d::UnitX()}
-                          .toRotationMatrix()}}
-            , gimbal_pitch_motor_(status, command, "/gimbal/pitch")
-            , gimbal_left_friction_(status, command, "/gimbal/left_friction")
-            , gimbal_right_friction_(status, command, "/gimbal/right_friction") {
-
-            gimbal_pitch_motor_.configure(
-                device::LkMotor::Config{device::LkMotor::Type::kMG4010Ei10}
-                    .set_reversed()
-                    .set_encoder_zero_point(
-                        static_cast<int>(status.get_parameter("pitch_motor_zero_point").as_int())));
-
-            gimbal_left_friction_.configure(
-                device::DjiMotor::Config{device::DjiMotor::Type::kM3508, 1}
-                    .set_reduction_ratio(1.)
-                    .set_reversed());
-            gimbal_right_friction_.configure(
-                device::DjiMotor::Config{device::DjiMotor::Type::kM3508, 2}.set_reduction_ratio(
-                    1.));
-
-            status.register_output("/gimbal/yaw/velocity_imu", gimbal_yaw_velocity_bmi088_);
-            status.register_output("/gimbal/pitch/velocity_imu", gimbal_pitch_velocity_bmi088_);
-            status.register_output("/gimbal/auto_aim/imu_snapshot", imu_snapshot_output_);
-            status.register_output("/gimbal/auto_aim/exposure_signal", camera_signal_output_);
-
-            auto options = librmcs::board::AdvancedOptions{};
-            options.dangerously_skip_version_checks = true;
-            board_ = std::make_unique<librmcs::board::RmcsBoardLite>(*this, serial_filter, options);
-
-            board_->start_transmit().gpio_digital_read(
-                Spec::kGpios.kUart1Rx, {
-                                           .period_ms = 0,
-                                           .asap = false,
-                                           .rising_edge = false,
-                                           .falling_edge = true,
-                                           .capture_timestamp = true,
-                                           .pull = librmcs::data::GpioPull::kUp,
-                                       });
-        }
-
-        ~TopBoard() override = default;
-
-        [[nodiscard]] auto gimbal_yaw_velocity() const -> double {
-            return *gimbal_yaw_velocity_bmi088_;
-        }
-
-        void request_hard_sync_read() {
-            // RMCS-lite top board variant currently has no GPIO hard-sync request
-            // path.
-        }
-
-        void update() {
-            gimbal_pitch_motor_.update_status();
-            gimbal_left_friction_.update_status();
-            gimbal_right_friction_.update_status();
-
-            const double pitch_encoder_angle = gimbal_pitch_motor_.angle();
-
-            if (auto snapshot = bmi088_.snapshot()) {
-                *gimbal_pitch_velocity_bmi088_ = snapshot->gyro_body.y();
-                *gimbal_yaw_velocity_bmi088_ = snapshot->gyro_body.z();
-                tf_->set_transform<rmcs_description::PitchLink, rmcs_description::OdomImu>(
-                    snapshot->orientation.conjugate());
-            }
-
-            tf_->set_state<rmcs_description::YawLink, rmcs_description::PitchLink>(
-                pitch_encoder_angle);
-        }
-
-        void command_update() const {
-            auto builder = board_->start_transmit();
-            builder.can_transmit(
-                Spec::kCans.kCan0, //
-                {
-                    .can_id = 0x141,
-                    .can_data = gimbal_pitch_motor_.generate_torque_command().as_bytes(),
-                });
-            builder.can_transmit(
-                Spec::kCans.kCan1, //
-                {
-                    .can_id = 0x200,
-                    .can_data =
-                        device::CanPacket8{
-                            gimbal_left_friction_.generate_command(),
-                            device::CanPacket8::PaddingQuarter{},
-                            device::CanPacket8::PaddingQuarter{},
-                            device::CanPacket8::PaddingQuarter{},
-                        }
-                            .as_bytes(),
-                });
-            builder.can_transmit(
-                Spec::kCans.kCan2, //
-                {
-                    .can_id = 0x200,
-                    .can_data =
-                        device::CanPacket8{
-                            device::CanPacket8::PaddingQuarter{},
-                            gimbal_right_friction_.generate_command(),
-                            device::CanPacket8::PaddingQuarter{},
-                            device::CanPacket8::PaddingQuarter{},
-                        }
-                            .as_bytes(),
-                });
-        }
-
-        void can_receive_callback(const Spec::Can& can, const View::Can& data) override {
-            if (data.is_extended_can_id || data.is_remote_transmission) [[unlikely]]
-                return;
-            if (can == Spec::kCans.kCan0) {
-                if (data.can_id == 0x141)
-                    gimbal_pitch_motor_.store_status(data.can_data);
-                monitor_.tick("Top::Can0", data.can_id);
-            } else if (can == Spec::kCans.kCan1) {
-                if (data.can_id == 0x201)
-                    gimbal_left_friction_.store_status(data.can_data);
-                monitor_.tick("Top::Can1", data.can_id);
-            } else if (can == Spec::kCans.kCan2) {
-                if (data.can_id == 0x202)
-                    gimbal_right_friction_.store_status(data.can_data);
-                monitor_.tick("Top::Can2", data.can_id);
-            }
-        }
-
-        void accelerometer_receive_callback(const View::ImuAccelerometer& data) override {
-            const auto timestamp = board_clock_lifter_.advance_timebase(data.timestamp_quarter_us);
-            bmi088_.push_accelerometer_sample(data.x, data.y, data.z, timestamp);
-            monitor_.tick("Top::Imu", "Acc");
-        }
-
-        void gyroscope_receive_callback(const View::ImuGyroscope& data) override {
-            const auto timestamp = board_clock_lifter_.lift_timestamp(data.timestamp_quarter_us);
-            monitor_.tick("Top::Imu", "Gyr");
-            if (!timestamp.has_value())
-                return;
-            auto snapshot =
-                bmi088_.try_update_with_gyroscope_sample(data.x, data.y, data.z, *timestamp);
-            if (snapshot)
-                imu_snapshot_output_.emit(*snapshot);
-        }
-
-        void gpio_digital_read_result_callback(
-            const Spec::Gpio& gpio, const View::GpioDigital& data) override {
-            if (gpio != Spec::kGpios.kUart1Rx)
-                return;
-            if (!data.timestamp_quarter_us)
-                return;
-
-            const auto timestamp = board_clock_lifter_.lift_timestamp(*data.timestamp_quarter_us);
-            if (!timestamp.has_value())
-                return;
-
-            camera_signal_output_.emit(*timestamp);
-            monitor_.tick("Top::CameraSync", "Active");
-        }
-
-        auto status() const -> std::vector<std::string> { return monitor_.text(); }
-
-        OutputInterface<rmcs_description::Tf>& tf_;
-        OutputInterface<double> gimbal_yaw_velocity_bmi088_;
-        OutputInterface<double> gimbal_pitch_velocity_bmi088_;
-
-        EventOutputInterface<rmcs_msgs::ImuSnapshot> imu_snapshot_output_;
-        EventOutputInterface<rmcs_msgs::BoardClock::time_point> camera_signal_output_;
-
-        device::Bmi088Ekf bmi088_;
-        device::BoardClockLifter board_clock_lifter_;
-        device::LkMotor gimbal_pitch_motor_;
-        device::DjiMotor gimbal_left_friction_;
-        device::DjiMotor gimbal_right_friction_;
-
-        StatusMonitor monitor_{};
-        std::unique_ptr<librmcs::board::RmcsBoardLite> board_;
-    };
-
     auto status_service_callback(const std::shared_ptr<std_srvs::srv::Trigger::Response>& response)
         -> void {
         response->success = true;
@@ -865,4 +873,4 @@ private:
 } // namespace rmcs_core::hardware
 
 #include <pluginlib/class_list_macros.hpp>
-PLUGINLIB_EXPORT_CLASS(rmcs_core::hardware::DeformableInfantryOmni, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(rmcs_core::hardware::DeformableInfantryOmniB, rmcs_executor::Component)
