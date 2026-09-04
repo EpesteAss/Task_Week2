@@ -1,0 +1,30 @@
+rmcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+
+    components:
+      - rmcs_core::hardware::M3508TestHardware -> m3508_hardware
+      - rmcs_core::controller::motor::M3508PidController -> task2_pid
+
+
+m3508_hardware:
+  ros__parameters:
+    board_serial: ""
+
+task2_pid:
+  ros__parameters:
+    kp: 0.003
+    ki: 0.0
+    kd: 0.0
+
+    max_velocity: 100.0
+
+    integral_min: -100.0
+    integral_max: 100.0
+
+    output_min: -3.0
+    output_max: 3.0
+
+    sampling_frequency: 1000.0
+    filter_cutoff_frequency: 50.0
+
