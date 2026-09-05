@@ -4,27 +4,31 @@ rmcs_executor:
 
     components:
       - rmcs_core::hardware::M3508TestHardware -> m3508_hardware
-      - rmcs_core::controller::motor::M3508PidController -> task2_pid
+      - rmcs_core::controller::pid::PidController -> task2_pid
+      - rmcs_core::debug::Task2Telemetry -> task2_telemetry
 
 
 m3508_hardware:
   ros__parameters:
     board_serial: ""
+    max_velocity: 100.0
+
 
 task2_pid:
   ros__parameters:
-    kp: 0.003
-    ki: 0.000
-    kd: 0.0
+    measurement: /m3508/velocity
+    setpoint: /m3508/target_velocity
+    control: /m3508/control_torque
 
-    max_velocity: 100.0
+    kp: 0.002
+    ki: 0.00008
+    kd: 0.0
 
     integral_min: -100.0
     integral_max: 100.0
 
+    integral_split_min: -100.0
+    integral_split_max: 100.0
+
     output_min: -3.0
     output_max: 3.0
-
-    sampling_frequency: 1000.0
-    filter_cutoff_frequency: 20.0
-

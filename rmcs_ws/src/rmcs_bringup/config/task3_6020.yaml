@@ -4,34 +4,76 @@ rmcs_executor:
 
     components:
       - rmcs_core::hardware::M6020Task3Hardware -> m6020_hardware
-      - rmcs_core::controller::motor::M6020DoublePidController -> task3_pid
+      - rmcs_core::debug::Task3TargetAngle -> task3_target_angle
+      - rmcs_core::controller::pid::PidController -> task3_angle_pid
+      - rmcs_core::controller::pid::PidController -> task3_velocity_pid
+      - rmcs_core::broadcaster::ValueBroadcaster -> task3_broadcaster
+
 
 m6020_hardware:
   ros__parameters:
     board_serial: ""
 
-task3_pid:
+
+task3_target_angle:
   ros__parameters:
-    # 角度外环
-    angle_kp: 2.0
-    angle_ki: 0.0
-    angle_kd: 0.0
+    # 启动时默认目标角度，单位 rad
+    target_angle: -180.0
 
-    # 速度内环
-    velocity_kp: 0.02
-    velocity_ki: 0.0
-    velocity_kd: 0.0
 
-    # 外环输出：目标速度
-    max_velocity: 20.0
+task3_angle_pid:
+  ros__parameters:
+    # =========================================================
+    # 外环：角度 -> 目标速度
+    # =========================================================
 
-    # 角度积分限幅
-    angle_integral_min: -1.0
-    angle_integral_max: 1.0
+    measurement: /m6020/angle
+    setpoint: /m6020/target_angle
+    control: /m6020/target_velocity
 
-    # 速度积分限幅
-    velocity_integral_min: -10.0
-    velocity_integral_max: 10.0
+    # 先用保守参数
+    kp: 3.2
+    ki: 0.0
+    kd: 0.0
 
-    # 最终扭矩限幅
-    max_torque: 1.0
+    integral_min: -1.0
+    integral_max: 1.0
+
+    integral_split_min: -100.0
+    integral_split_max: 100.0
+
+    output_min: -36.0
+    output_max: 36.0
+
+
+task3_velocity_pid:
+  ros__parameters:
+    
+    measurement: /m6020/velocity
+    setpoint: /m6020/target_velocity
+    control: /m6020/control_torque
+
+  
+    kp: 0.01
+    ki: 0.0000
+    kd: 0.00
+
+    integral_min: -10.0
+    integral_max: 10.0
+
+    integral_split_min: -100.0
+    integral_split_max: 100.0
+
+    output_min: -2.5
+    output_max: 2.5
+
+
+task3_broadcaster:
+  ros__parameters:
+
+
+    forward_list:
+      - /m6020/angle
+      - /m6020/velocity
+      - /m6020/target_velocity
+      - /m6020/control_torque
