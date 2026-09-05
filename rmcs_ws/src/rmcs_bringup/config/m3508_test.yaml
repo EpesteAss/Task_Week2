@@ -14,7 +14,7 @@ m3508_hardware:
 task2_pid:
   ros__parameters:
     kp: 0.003
-    ki: 0.0
+    ki: 0.000
     kd: 0.0
 
     max_velocity: 100.0
@@ -26,5 +26,5 @@ task2_pid:
     output_max: 3.0
 
     sampling_frequency: 1000.0
-    filter_cutoff_frequency: 50.0
+    filter_cutoff_frequency: 20.0
 
