@@ -10,6 +10,9 @@
 
 namespace rmcs_core::controller::motor {
 
+//=========================
+//该代码仅在调试初期使用过，最终用的rmcs组件
+
 class M6020DoublePidController
     : public rmcs_executor::Component
     , public rclcpp::Node {

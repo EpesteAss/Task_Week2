@@ -17,21 +17,19 @@ m6020_hardware:
 
 task3_target_angle:
   ros__parameters:
-    # 启动时默认目标角度，单位 rad
+    
     target_angle: -180.0
 
 
 task3_angle_pid:
   ros__parameters:
-    # =========================================================
-    # 外环：角度 -> 目标速度
-    # =========================================================
+
 
     measurement: /m6020/angle
     setpoint: /m6020/target_angle
     control: /m6020/target_velocity
 
-    # 先用保守参数
+    
     kp: 3.2
     ki: 0.0
     kd: 0.0
